@@ -27,6 +27,9 @@
 #include <linux/wait.h>
 #include <linux/kthread.h>
 #include <linux/version.h>
+
+#include <linux/kernel.h>
+#include <linux/printk.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
 #include <linux/uio.h>
 #endif
@@ -292,6 +295,97 @@ static void char_sgdma_unmap_user_buf(struct xdma_io_cb *cb, bool write)
 	cb->pages = NULL;
 }
 
+static void char_sgdma_unmap_kernel_buf(struct xdma_io_cb *cb, bool write)
+{
+	int i;
+
+	sg_free_table(&cb->sgt);
+
+	if (!cb->pages || !cb->pages_nr)
+		return;
+	/*
+	for (i = 0; i < cb->pages_nr; i++) {
+		if (cb->pages[i]) {
+			//if (!write)
+			//	set_page_dirty_lock(cb->pages[i]);
+			put_page(cb->pages[i]);
+		} else
+			break;
+	}
+	*/
+
+	if (i != cb->pages_nr)
+		pr_info("sgl pages %d/%u.\n", i, cb->pages_nr);
+
+	kfree(cb->pages);
+	cb->pages = NULL;
+}
+
+
+static void dump_buffer_hex(const void *buf, size_t len, size_t max_bytes)
+{
+    size_t to_print = len;
+
+    if (len > max_bytes)
+        to_print = max_bytes;
+
+    print_hex_dump(KERN_INFO, "DMA READ: ",
+                   DUMP_PREFIX_OFFSET, 16, 1,
+                   buf, to_print, true);
+}
+
+
+static int char_sgdma_map_kernel_buf_to_sgl(struct xdma_io_cb *cb, bool write)
+{
+	struct sg_table *sgt = &cb->sgt;
+	unsigned long len = cb->len;
+	void *buf = cb->buf;
+	struct scatterlist *sg;
+	unsigned int pages_nr = (((unsigned long)buf + len + PAGE_SIZE - 1) -
+				 ((unsigned long)buf & PAGE_MASK))
+				>> PAGE_SHIFT;
+	int i;
+
+	if (pages_nr == 0)
+		return -EINVAL;
+
+	if (sg_alloc_table(sgt, pages_nr, GFP_KERNEL)) {
+		pr_err("sgl OOM.\n");
+		return -ENOMEM;
+	}
+
+	cb->pages = kcalloc(pages_nr, sizeof(struct page *), GFP_KERNEL);
+	if (!cb->pages) {
+		sg_free_table(sgt);
+		pr_err("pages OOM.\n");
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < pages_nr; i++) {
+		cb->pages[i] = virt_to_page(buf);
+		buf += PAGE_SIZE;
+	}
+
+	for (i = 0, sg = sgt->sgl; i < pages_nr; i++, sg = sg_next(sg)) {
+		unsigned int offset = offset_in_page(cb->buf);//Attention
+		//unsigned int offset = (i == 0) ? offset_in_page(cb->buf) : 0;
+		unsigned int nbytes =
+			min_t(unsigned int, PAGE_SIZE - offset, len);
+
+		flush_dcache_page(cb->pages[i]);
+		sg_set_page(sg, cb->pages[i], nbytes, offset);
+
+		len -= nbytes;
+	}
+
+	if (len) {
+		pr_err("Invalid kernel buffer length. Cannot map to sgl\n");
+		return -EINVAL;
+	}
+	cb->pages_nr = pages_nr;
+
+	return 0;
+}
 static int char_sgdma_map_user_buf_to_sgl(struct xdma_io_cb *cb, bool write)
 {
 	struct sg_table *sgt = &cb->sgt;
@@ -839,6 +933,69 @@ static int ioctl_do_aperture_dma(struct xdma_engine *engine, unsigned long arg,
 
 	return io.error;
 }
+
+static int ioctl_do_mmap_read(struct file *file, struct xdma_engine *engine, unsigned long arg)
+{
+	struct xdma_read_test_ioctl io;
+	int rv;
+	struct xdma_io_cb cb;
+	ssize_t res;
+	struct xdma_cdev *xcdev;
+    struct xdma_dev *xdev;
+
+	rv = copy_from_user(&io, (struct xdma_read_test_ioctl __user *)arg,
+				sizeof(struct xdma_read_test_ioctl));
+
+	if (rv < 0) {
+		dbg_tfr("%s failed to copy from user space 0x%lx\n",
+			engine->name, arg);
+		return -EINVAL;
+	}
+	void *kernel_buf = kmalloc(io.len, GFP_KERNEL);
+	if (!kernel_buf) {
+		pr_err("Failed to allocate kernel buffer for mmap read (size = %ld)\n", io.len);
+		return -ENOMEM;
+	}
+
+	//check_transfer_align()
+
+	memset(&cb, 0, sizeof(struct xdma_io_cb));
+	cb.buf = kernel_buf;
+	cb.len = io.len;
+	cb.ep_addr = 0;
+	cb.write = false;
+
+	rv = char_sgdma_map_kernel_buf_to_sgl(&cb, false);
+	if (rv < 0) {
+		kfree(kernel_buf);
+		return rv;
+	}
+
+	xcdev = (struct xdma_cdev *)file->private_data;
+    if (!xcdev) {
+		kfree(kernel_buf);
+        pr_err("xcdev is NULL\n");
+        return -EINVAL;
+    }
+
+    xdev = xcdev->xdev;
+    if (!xdev) {
+		kfree(kernel_buf);
+        pr_err("xdev is NULL\n");
+        return -EINVAL;
+    }
+
+	res = xdma_xfer_submit(xdev, engine->channel, false, 0, &cb.sgt,
+				0, c2h_timeout * 1000);
+
+	dump_buffer_hex(kernel_buf, io.len, io.len);
+
+	char_sgdma_unmap_kernel_buf(&cb, false);
+
+	kfree(kernel_buf);
+
+	return res;
+}
 	
 static long char_sgdma_ioctl(struct file *file, unsigned int cmd,
 		unsigned long arg)
@@ -880,6 +1037,9 @@ static long char_sgdma_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case IOCTL_XDMA_APERTURE_W:
 		rv = ioctl_do_aperture_dma(engine, arg, 1);
+		break;
+	case IOCTL_XDMA_MMAP_READ:
+		rv = ioctl_do_mmap_read(file, engine, arg);
 		break;
 	default:
 		dbg_perf("Unsupported operation\n");

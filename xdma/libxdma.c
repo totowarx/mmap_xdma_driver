@@ -1850,7 +1850,9 @@ static int enable_msi_msix(struct xdma_dev *xdev, struct pci_dev *pdev)
 		rv = pci_enable_msix(pdev, xdev->entry, req_nvec);
 #endif
 		if (rv < 0)
+		{
 			dbg_init("Couldn't enable MSI-X mode: %d\n", rv);
+		}
 
 		xdev->msix_enabled = 1;
 

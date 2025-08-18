@@ -67,6 +67,10 @@ struct xdma_aperture_ioctl {
 	unsigned long done;
 };
 
+struct xdma_read_test_ioctl {
+	unsigned long len;	
+};
+
 
 /* IOCTL codes */
 
@@ -78,5 +82,6 @@ struct xdma_aperture_ioctl {
 #define IOCTL_XDMA_ALIGN_GET    _IOR('q', 6, int)
 #define IOCTL_XDMA_APERTURE_R   _IOW('q', 7, struct xdma_aperture_ioctl *)
 #define IOCTL_XDMA_APERTURE_W   _IOW('q', 8, struct xdma_aperture_ioctl *)
+#define IOCTL_XDMA_MMAP_READ    _IOW('q', 9, struct xdma_read_test_ioctl *)
 
 #endif /* _XDMA_IOCALLS_POSIX_H_ */
